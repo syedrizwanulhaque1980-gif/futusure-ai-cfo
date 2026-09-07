@@ -331,3 +331,5 @@ app.listen(PORT, () => {
   console.log(`  Stripe: ${process.env.STRIPE_SECRET_KEY ? "configured" : "NOT configured"}`);
   console.log(`  Health check: http://localhost:${PORT}/api/health\n`);
 });
+/ force fresh deploy
+
