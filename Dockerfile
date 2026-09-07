@@ -9,6 +9,7 @@ RUN npm install
 # Copy the rest of the actual source — this is the step that was
 # silently missing before, which is why server.js wasn't in the image
 COPY . .
+RUN ls -la /app
 
 # Build the React frontend into /app/dist
 RUN npm run build
