@@ -1,7 +1,7 @@
 /**
  * Futusure AI CFO – Express server
  * Razorpay-only (domestic + international)
- * Includes webhook payment verification
+ * Claude proxy + payment verification
  */
 
 import express from "express";
@@ -19,25 +19,8 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const CLIENT_URL = process.env.CLIENT_URL || `http://localhost:${PORT}`;
 
-// ── Simple in-memory store for verified payments ──────────────
-// In production → replace with PostgreSQL / MongoDB / Redis
-const verifiedPayments = new Map(); // key = payment_id
-
-// ── Plans (single source of truth) ────────────────────────────
-const PLANS = {
-  onetime: {
-    name: "One-time Analysis",
-    amounts: { INR: 49900, USD: 900, EUR: 900, GBP: 800 },
-  },
-  monthly: {
-    name: "Monthly Subscription",
-    amounts: { INR: 149900, USD: 2900, EUR: 2700, GBP: 2300 },
-  },
-  yearly: {
-    name: "Yearly Subscription",
-    amounts: { INR: 1499900, USD: 29000, EUR: 27000, GBP: 23000 },
-  },
-};
+app.use(cors({ origin: true }));
+app.use(express.json({ limit: "25mb" }));
 
 // ── Rate limiting ─────────────────────────────────────────────
 const aiLimiter = rateLimit({
@@ -56,80 +39,24 @@ const paymentLimiter = rateLimit({
   message: { error: "RATE_LIMITED", message: "Too many payment attempts. Try again later." },
 });
 
-// ── IMPORTANT: Webhook needs RAW body ─────────────────────────
-// This must come BEFORE express.json()
-app.post(
-  "/api/razorpay-webhook",
-  express.raw({ type: "application/json" }),
-  (req, res) => {
-    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+// ── Plans (single source of truth) ────────────────────────────
+const PLANS = {
+  onetime: {
+    name: "One-time Analysis",
+    amounts: { INR: 49900, USD: 900, EUR: 900, GBP: 800 }, // in smallest unit
+  },
+  monthly: {
+    name: "Monthly Subscription",
+    amounts: { INR: 149900, USD: 2900, EUR: 2700, GBP: 2300 },
+  },
+  yearly: {
+    name: "Yearly Subscription",
+    amounts: { INR: 1499900, USD: 29000, EUR: 27000, GBP: 23000 },
+  },
+};
 
-    if (!webhookSecret) {
-      console.error("RAZORPAY_WEBHOOK_SECRET is not set");
-      return res.status(503).send("Webhook not configured");
-    }
-
-    const signature = req.headers["x-razorpay-signature"];
-    if (!signature) {
-      return res.status(400).send("Missing signature");
-    }
-
-    // Verify signature
-    const expectedSignature = crypto
-      .createHmac("sha256", webhookSecret)
-      .update(req.body)
-      .digest("hex");
-
-    if (expectedSignature !== signature) {
-      console.warn("Invalid Razorpay webhook signature");
-      return res.status(400).send("Invalid signature");
-    }
-
-    let event;
-    try {
-      event = JSON.parse(req.body.toString());
-    } catch (err) {
-      console.error("Failed to parse webhook body:", err);
-      return res.status(400).send("Invalid JSON");
-    }
-
-    const eventType = event.event;
-    console.log("Razorpay webhook received:", eventType);
-
-    // Handle successful payment
-    if (eventType === "payment.captured" || eventType === "order.paid") {
-      const payment = event.payload?.payment?.entity;
-      const order = event.payload?.order?.entity;
-
-      if (payment && payment.status === "captured") {
-        const paymentId = payment.id;
-        const orderId = payment.order_id;
-        const amount = payment.amount;
-        const currency = payment.currency;
-        const plan = payment.notes?.plan || order?.notes?.plan || "onetime";
-
-        // Store as verified
-        verifiedPayments.set(paymentId, {
-          orderId,
-          plan,
-          amount,
-          currency,
-          verifiedAt: new Date().toISOString(),
-          source: "webhook",
-        });
-
-        console.log(`✅ Payment verified via webhook: ${paymentId} | Plan: ${plan}`);
-      }
-    }
-
-    // Always respond 200 so Razorpay doesn't retry unnecessarily
-    res.status(200).json({ status: "ok" });
-  }
-);
-
-// Now enable JSON body parser for other routes
-app.use(cors({ origin: true }));
-app.use(express.json({ limit: "25mb" }));
+// Simple in-memory store for verified payments (replace with DB later)
+const verifiedPayments = new Map();
 
 // ── Health ────────────────────────────────────────────────────
 app.get("/api/health", (_req, res) => {
@@ -137,12 +64,11 @@ app.get("/api/health", (_req, res) => {
     ok: true,
     hasKey: Boolean(process.env.ANTHROPIC_API_KEY),
     hasRazorpay: Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET),
-    hasWebhook: Boolean(process.env.RAZORPAY_WEBHOOK_SECRET),
     model: process.env.CLAUDE_MODEL || "claude-sonnet-4-20250514",
   });
 });
 
-// ── Create Razorpay Order ─────────────────────────────────────
+// ── Create Razorpay Order (works for all currencies) ──────────
 app.post("/api/create-order", paymentLimiter, async (req, res) => {
   const keyId = process.env.RAZORPAY_KEY_ID;
   const keySecret = process.env.RAZORPAY_KEY_SECRET;
@@ -203,7 +129,7 @@ app.post("/api/create-order", paymentLimiter, async (req, res) => {
   }
 });
 
-// ── Client-side Verify (still useful for immediate UX) ────────
+// ── Verify Razorpay Payment ───────────────────────────────────
 app.post("/api/verify-payment", paymentLimiter, (req, res) => {
   const keySecret = process.env.RAZORPAY_KEY_SECRET;
   const { razorpay_order_id, razorpay_payment_id, razorpay_signature, plan } = req.body || {};
@@ -228,12 +154,11 @@ app.post("/api/verify-payment", paymentLimiter, (req, res) => {
     return res.status(400).json({ error: "SIGNATURE_INVALID", verified: false });
   }
 
-  // Also store it (webhook will also store it – this is for faster UX)
+  // Store verified payment (in production use a real database)
   verifiedPayments.set(razorpay_payment_id, {
     orderId: razorpay_order_id,
     plan,
     verifiedAt: new Date().toISOString(),
-    source: "client",
   });
 
   res.json({
@@ -243,15 +168,6 @@ app.post("/api/verify-payment", paymentLimiter, (req, res) => {
     plan,
     planName: PLANS[plan]?.name,
   });
-});
-
-// ── Check if a payment is already verified (used by frontend) ─
-app.get("/api/payment-status/:paymentId", (req, res) => {
-  const record = verifiedPayments.get(req.params.paymentId);
-  if (record) {
-    return res.json({ verified: true, ...record });
-  }
-  res.json({ verified: false });
 });
 
 // ── Claude Proxy ──────────────────────────────────────────────
@@ -316,8 +232,7 @@ if (fs.existsSync(distPath)) {
 
 app.listen(PORT, () => {
   console.log(`\n  Futusure AI CFO running on http://localhost:${PORT}`);
-  console.log(`  Claude API: ${process.env.ANTHROPIC_API_KEY ? "loaded" : "NO – demo mode"}`);
+  console.log(`  API key loaded: ${process.env.ANTHROPIC_API_KEY ? "yes" : "NO – demo mode"}`);
   console.log(`  Razorpay: ${process.env.RAZORPAY_KEY_ID ? "configured" : "NOT configured"}`);
-  console.log(`  Webhook: ${process.env.RAZORPAY_WEBHOOK_SECRET ? "configured" : "NOT configured"}`);
   console.log(`  Health: http://localhost:${PORT}/api/health\n`);
 });
