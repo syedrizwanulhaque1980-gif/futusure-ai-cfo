@@ -1,11 +1,7 @@
 /**
- * Futusure AI CFO – Express proxy for Claude + Payments
- * Keeps the Anthropic key, Razorpay secret, and Stripe secret server-side.
- * Never expose these to the browser.
- *
- * Usage:
- *   Fill in .env (see .env.example), then:
- *   npm run server   (dev)   or   npm start   (prod, after `npm run build`)
+ * Futusure AI CFO – Express server
+ * Razorpay-only (domestic + international)
+ * Includes webhook payment verification
  */
 
 import express from "express";
@@ -13,7 +9,9 @@ import cors from "cors";
 import dotenv from "dotenv";
 import crypto from "crypto";
 import rateLimit from "express-rate-limit";
-import Stripe from "stripe";
+import path from "path";
+import { fileURLToPath } from "url";
+import fs from "fs";
 
 dotenv.config();
 
@@ -21,56 +19,30 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const CLIENT_URL = process.env.CLIENT_URL || `http://localhost:${PORT}`;
 
-const stripe = process.env.STRIPE_SECRET_KEY
-  ? new Stripe(process.env.STRIPE_SECRET_KEY)
-  : null;
+// ── Simple in-memory store for verified payments ──────────────
+// In production → replace with PostgreSQL / MongoDB / Redis
+const verifiedPayments = new Map(); // key = payment_id
 
-app.use(cors({ origin: true }));
-
-// Stripe webhook needs the RAW body, so it must be registered BEFORE express.json()
-app.post(
-  "/api/stripe-webhook",
-  express.raw({ type: "application/json" }),
-  (req, res) => {
-    if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
-      return res.status(503).send("Stripe not configured");
-    }
-    let event;
-    try {
-      const sig = req.headers["stripe-signature"];
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        process.env.STRIPE_WEBHOOK_SECRET
-      );
-    } catch (err) {
-      console.error("Stripe webhook signature verification failed:", err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-      // ── Persist this event in your DB, keyed by session.id ──
-      // This is the durable, trustworthy source of "this person paid."
-      // Client-side confirmation (below) is only for immediate UX;
-      // this webhook is what should actually unlock/renew access.
-      console.log("Stripe payment confirmed:", session.id, session.metadata);
-    }
-
-    res.json({ received: true });
-  }
-);
-
-app.use(express.json({ limit: "25mb" })); // PDFs / images as base64 can be large
+// ── Plans (single source of truth) ────────────────────────────
+const PLANS = {
+  onetime: {
+    name: "One-time Analysis",
+    amounts: { INR: 49900, USD: 900, EUR: 900, GBP: 800 },
+  },
+  monthly: {
+    name: "Monthly Subscription",
+    amounts: { INR: 149900, USD: 2900, EUR: 2700, GBP: 2300 },
+  },
+  yearly: {
+    name: "Yearly Subscription",
+    amounts: { INR: 1499900, USD: 29000, EUR: 27000, GBP: 23000 },
+  },
+};
 
 // ── Rate limiting ─────────────────────────────────────────────
-// Protects the Anthropic bill and the payment endpoints from abuse.
-// NOTE: in multi-instance/production deployments, back this with a shared
-// store (e.g. Redis) instead of the default in-memory store, since each
-// server instance would otherwise track its own limits independently.
 const aiLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 30, // 30 AI calls/hour per IP — tune to your real usage patterns
+  windowMs: 60 * 60 * 1000,
+  max: 40,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "RATE_LIMITED", message: "Too many AI requests. Try again later." },
@@ -78,31 +50,99 @@ const aiLimiter = rateLimit({
 
 const paymentLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20,
+  max: 25,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "RATE_LIMITED", message: "Too many payment attempts. Try again later." },
 });
 
+// ── IMPORTANT: Webhook needs RAW body ─────────────────────────
+// This must come BEFORE express.json()
+app.post(
+  "/api/razorpay-webhook",
+  express.raw({ type: "application/json" }),
+  (req, res) => {
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+
+    if (!webhookSecret) {
+      console.error("RAZORPAY_WEBHOOK_SECRET is not set");
+      return res.status(503).send("Webhook not configured");
+    }
+
+    const signature = req.headers["x-razorpay-signature"];
+    if (!signature) {
+      return res.status(400).send("Missing signature");
+    }
+
+    // Verify signature
+    const expectedSignature = crypto
+      .createHmac("sha256", webhookSecret)
+      .update(req.body)
+      .digest("hex");
+
+    if (expectedSignature !== signature) {
+      console.warn("Invalid Razorpay webhook signature");
+      return res.status(400).send("Invalid signature");
+    }
+
+    let event;
+    try {
+      event = JSON.parse(req.body.toString());
+    } catch (err) {
+      console.error("Failed to parse webhook body:", err);
+      return res.status(400).send("Invalid JSON");
+    }
+
+    const eventType = event.event;
+    console.log("Razorpay webhook received:", eventType);
+
+    // Handle successful payment
+    if (eventType === "payment.captured" || eventType === "order.paid") {
+      const payment = event.payload?.payment?.entity;
+      const order = event.payload?.order?.entity;
+
+      if (payment && payment.status === "captured") {
+        const paymentId = payment.id;
+        const orderId = payment.order_id;
+        const amount = payment.amount;
+        const currency = payment.currency;
+        const plan = payment.notes?.plan || order?.notes?.plan || "onetime";
+
+        // Store as verified
+        verifiedPayments.set(paymentId, {
+          orderId,
+          plan,
+          amount,
+          currency,
+          verifiedAt: new Date().toISOString(),
+          source: "webhook",
+        });
+
+        console.log(`✅ Payment verified via webhook: ${paymentId} | Plan: ${plan}`);
+      }
+    }
+
+    // Always respond 200 so Razorpay doesn't retry unnecessarily
+    res.status(200).json({ status: "ok" });
+  }
+);
+
+// Now enable JSON body parser for other routes
+app.use(cors({ origin: true }));
+app.use(express.json({ limit: "25mb" }));
+
+// ── Health ────────────────────────────────────────────────────
 app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
     hasKey: Boolean(process.env.ANTHROPIC_API_KEY),
     hasRazorpay: Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET),
-    hasStripe: Boolean(process.env.STRIPE_SECRET_KEY),
+    hasWebhook: Boolean(process.env.RAZORPAY_WEBHOOK_SECRET),
     model: process.env.CLAUDE_MODEL || "claude-sonnet-4-20250514",
   });
 });
 
-// ── Plans (single source of truth, server-side) ──────────────
-// Amounts are in the smallest currency unit (paise for INR, cents for USD/EUR/GBP).
-const PLANS = {
-  onetime: { name: "One-time Analysis", inr: 49900, usd: 900, eur: 900, gbp: 800 },
-  monthly: { name: "Monthly Subscription", inr: 149900, usd: 2900, eur: 2700, gbp: 2300 },
-  yearly: { name: "Yearly Subscription", inr: 1499900, usd: 29000, eur: 27000, gbp: 23000 },
-};
-
-// ── Razorpay: Create Order (INR) ──────────────────────────────
+// ── Create Razorpay Order ─────────────────────────────────────
 app.post("/api/create-order", paymentLimiter, async (req, res) => {
   const keyId = process.env.RAZORPAY_KEY_ID;
   const keySecret = process.env.RAZORPAY_KEY_SECRET;
@@ -114,26 +154,36 @@ app.post("/api/create-order", paymentLimiter, async (req, res) => {
     });
   }
 
-  const { plan } = req.body || {};
+  const { plan, currency = "INR" } = req.body || {};
   const selected = PLANS[plan];
-  if (!selected) {
-    return res.status(400).json({ error: "Invalid plan. Use 'onetime', 'monthly', or 'yearly'." });
+  const cur = (currency || "INR").toUpperCase();
+
+  if (!selected || !selected.amounts[cur]) {
+    return res.status(400).json({ error: "Invalid plan or unsupported currency." });
   }
 
   try {
-    const auth = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+    const auth = Buffer.from(`\( {keyId}: \){keySecret}`).toString("base64");
     const response = await fetch("https://api.razorpay.com/v1/orders", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Basic ${auth}` },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Basic ${auth}`,
+      },
       body: JSON.stringify({
-        amount: selected.inr, // paise
-        currency: "INR",
-        receipt: `fs_${plan}_${Date.now()}`,
-        notes: { plan, product: "Futusure AI CFO" },
+        amount: selected.amounts[cur],
+        currency: cur,
+        receipt: `fs_\( {plan}_ \){Date.now()}`,
+        notes: {
+          plan,
+          product: "Futusure AI CFO",
+          currency: cur,
+        },
       }),
     });
 
     const data = await response.json();
+
     if (!response.ok) {
       console.error("Razorpay order error:", data);
       return res.status(response.status).json({ error: "ORDER_FAILED", details: data });
@@ -153,12 +203,7 @@ app.post("/api/create-order", paymentLimiter, async (req, res) => {
   }
 });
 
-// ── Razorpay: Verify Payment (THIS is what makes the paywall real) ──
-// Razorpay Checkout returns razorpay_order_id, razorpay_payment_id, and
-// razorpay_signature to the browser after a successful payment. The
-// signature is an HMAC-SHA256 of "order_id|payment_id" signed with your
-// key secret. If it doesn't match, the "payment" was never actually made
-// through Razorpay — never trust the client's word alone.
+// ── Client-side Verify (still useful for immediate UX) ────────
 app.post("/api/verify-payment", paymentLimiter, (req, res) => {
   const keySecret = process.env.RAZORPAY_KEY_SECRET;
   const { razorpay_order_id, razorpay_payment_id, razorpay_signature, plan } = req.body || {};
@@ -166,25 +211,31 @@ app.post("/api/verify-payment", paymentLimiter, (req, res) => {
   if (!keySecret) {
     return res.status(503).json({ error: "RAZORPAY_NOT_CONFIGURED" });
   }
+
   if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
     return res.status(400).json({ error: "MISSING_FIELDS" });
   }
 
   const expected = crypto
     .createHmac("sha256", keySecret)
-    .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+    .update(`\( {razorpay_order_id}| \){razorpay_payment_id}`)
     .digest("hex");
 
   const valid = expected === razorpay_signature;
 
   if (!valid) {
-    console.warn("Razorpay signature mismatch — rejecting unverified payment claim.");
+    console.warn("Razorpay signature mismatch");
     return res.status(400).json({ error: "SIGNATURE_INVALID", verified: false });
   }
 
-  // ── Persist { razorpay_payment_id, plan, verified: true, paidAt } to your DB here,
-  // keyed by user/account — this is the durable record that grants access,
-  // not anything the client stores itself.
+  // Also store it (webhook will also store it – this is for faster UX)
+  verifiedPayments.set(razorpay_payment_id, {
+    orderId: razorpay_order_id,
+    plan,
+    verifiedAt: new Date().toISOString(),
+    source: "client",
+  });
+
   res.json({
     verified: true,
     paymentId: razorpay_payment_id,
@@ -194,80 +245,23 @@ app.post("/api/verify-payment", paymentLimiter, (req, res) => {
   });
 });
 
-// ── Stripe: Checkout Session (international currencies) ──────
-app.post("/api/create-checkout-session", paymentLimiter, async (req, res) => {
-  if (!stripe) {
-    return res.status(503).json({
-      error: "STRIPE_NOT_CONFIGURED",
-      message: "Add STRIPE_SECRET_KEY on the server.",
-    });
+// ── Check if a payment is already verified (used by frontend) ─
+app.get("/api/payment-status/:paymentId", (req, res) => {
+  const record = verifiedPayments.get(req.params.paymentId);
+  if (record) {
+    return res.json({ verified: true, ...record });
   }
-
-  const { plan, currency = "usd" } = req.body || {};
-  const selected = PLANS[plan];
-  const cur = currency.toLowerCase();
-  if (!selected || !selected[cur]) {
-    return res.status(400).json({ error: "Invalid plan or unsupported currency." });
-  }
-
-  try {
-    const isRecurring = plan === "monthly" || plan === "yearly";
-    const session = await stripe.checkout.sessions.create({
-      mode: isRecurring ? "subscription" : "payment",
-      payment_method_types: ["card"],
-      line_items: [
-        {
-          price_data: {
-            currency: cur,
-            product_data: { name: `Futusure AI CFO – ${selected.name}` },
-            unit_amount: selected[cur],
-            ...(isRecurring && {
-              recurring: { interval: plan === "yearly" ? "year" : "month" },
-            }),
-          },
-          quantity: 1,
-        },
-      ],
-      metadata: { plan },
-      success_url: `${CLIENT_URL}/?session_id={CHECKOUT_SESSION_ID}&plan=${plan}`,
-      cancel_url: `${CLIENT_URL}/?checkout=cancelled`,
-    });
-
-    res.json({ url: session.url, sessionId: session.id });
-  } catch (err) {
-    console.error("Stripe session error:", err);
-    res.status(500).json({ error: "STRIPE_ERROR", message: err.message });
-  }
+  res.json({ verified: false });
 });
 
-// ── Stripe: Verify a Checkout Session after redirect back ────
-app.get("/api/verify-checkout-session", async (req, res) => {
-  if (!stripe) return res.status(503).json({ error: "STRIPE_NOT_CONFIGURED" });
-  const { session_id } = req.query;
-  if (!session_id) return res.status(400).json({ error: "MISSING_SESSION_ID" });
-
-  try {
-    const session = await stripe.checkout.sessions.retrieve(session_id);
-    const paid = session.payment_status === "paid" || session.status === "complete";
-    res.json({
-      verified: paid,
-      plan: session.metadata?.plan,
-      amount: session.amount_total,
-      currency: session.currency,
-    });
-  } catch (err) {
-    res.status(500).json({ error: "STRIPE_VERIFY_ERROR", message: err.message });
-  }
-});
-
-// ── Claude proxy (rate-limited) ───────────────────────────────
+// ── Claude Proxy ──────────────────────────────────────────────
 app.post("/api/claude", aiLimiter, async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
 
   if (!apiKey) {
     return res.status(503).json({
       error: "NO_API_KEY",
-      message: "ANTHROPIC_API_KEY is not set on the server. Add it to .env and restart.",
+      message: "ANTHROPIC_API_KEY is not set on the server.",
     });
   }
 
@@ -304,15 +298,11 @@ app.post("/api/claude", aiLimiter, async (req, res) => {
     res.json({ text, raw: data });
   } catch (err) {
     console.error("Proxy error:", err);
-    res.status(500).json({ error: "PROXY_ERROR", message: err.message || "Failed to reach Claude" });
+    res.status(500).json({ error: "PROXY_ERROR", message: err.message });
   }
 });
 
-// ── Serve the built React app in production ──────────────────
-import path from "path";
-import { fileURLToPath } from "url";
-import fs from "fs";
-
+// ── Serve frontend ────────────────────────────────────────────
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distPath = path.join(__dirname, "dist");
 
@@ -326,8 +316,8 @@ if (fs.existsSync(distPath)) {
 
 app.listen(PORT, () => {
   console.log(`\n  Futusure AI CFO running on http://localhost:${PORT}`);
-  console.log(`  API key loaded: ${process.env.ANTHROPIC_API_KEY ? "yes" : "NO – demo mode only"}`);
+  console.log(`  Claude API: ${process.env.ANTHROPIC_API_KEY ? "loaded" : "NO – demo mode"}`);
   console.log(`  Razorpay: ${process.env.RAZORPAY_KEY_ID ? "configured" : "NOT configured"}`);
-  console.log(`  Stripe: ${process.env.STRIPE_SECRET_KEY ? "configured" : "NOT configured"}`);
-  console.log(`  Health check: http://localhost:${PORT}/api/health\n`);
+  console.log(`  Webhook: ${process.env.RAZORPAY_WEBHOOK_SECRET ? "configured" : "NOT configured"}`);
+  console.log(`  Health: http://localhost:${PORT}/api/health\n`);
 });
