@@ -96,7 +96,7 @@ app.post("/api/create-order", paymentLimiter, async (req, res) => {
   }
 
   try {
-    const auth = Buffer.from(`\( {keyId}: \){keySecret}`).toString("base64");
+    const auth = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
     const response = await fetch("https://api.razorpay.com/v1/orders", {
       method: "POST",
       headers: {
@@ -106,7 +106,7 @@ app.post("/api/create-order", paymentLimiter, async (req, res) => {
       body: JSON.stringify({
         amount: selected.amounts[cur],
         currency: cur,
-        receipt: `fs_\( {plan}_ \){Date.now()}`,
+        receipt: `fs_${plan}_${Date.now()}`,
         notes: {
           plan,
           product: "Futusure AI CFO",
@@ -151,7 +151,7 @@ app.post("/api/verify-payment", paymentLimiter, (req, res) => {
 
   const expected = crypto
     .createHmac("sha256", keySecret)
-    .update(`\( {razorpay_order_id}| \){razorpay_payment_id}`)
+    .update(`${razorpay_order_id}|${razorpay_payment_id}`)
     .digest("hex");
 
   const valid = expected === razorpay_signature;
