@@ -11,6 +11,7 @@ import {
   CreditCard,
   Receipt,
   ShieldCheck,
+  Lock,
 } from "lucide-react";
 
 const ink = "#16233E";
@@ -513,7 +514,7 @@ function Onboarding({ onDone }) {
   );
 }
 
-function HomeScreen({ data }) {
+function HomeScreen({ data, paid = true, onUnlock }) {
   return (
     <div
       className="px-5 pt-6 pb-4 overflow-y-auto h-full"
@@ -557,7 +558,7 @@ function HomeScreen({ data }) {
           className="mt-2 rounded-lg p-4"
           style={{ background: "#FFFFFF", border: "1px solid #E2E5EC" }}
         >
-          {(data.briefing || []).map((b, i) => (
+          {(data.briefing || []).slice(0, paid ? undefined : 1).map((b, i) => (
             <div
               key={i}
               className={`flex gap-2 items-start ${i > 0 ? "mt-3" : ""}`}
@@ -586,6 +587,12 @@ function HomeScreen({ data }) {
               </p>
             </div>
           ))}
+          {!paid && (data.briefing || []).length > 1 && (
+            <div className="mt-3 flex items-center gap-2 text-xs" style={{ color: "#8890A0" }}>
+              <Lock size={14} />
+              {(data.briefing || []).length - 1} more recommendations in the full report
+            </div>
+          )}
         </div>
       </div>
 
@@ -609,19 +616,128 @@ function HomeScreen({ data }) {
             sub={data.metrics?.netProfitNote}
             tone="good"
           />
-          <LedgerRow
-            label="Cash on Hand"
-            value={data.metrics?.cash}
-            sub={data.metrics?.cashNote}
-            tone="bad"
-          />
-          <LedgerRow
-            label="Receivables"
-            value={data.metrics?.receivables}
-            sub={data.metrics?.receivablesNote}
-            tone="bad"
-          />
+          {paid ? (
+            <>
+              <LedgerRow
+                label="Cash on Hand"
+                value={data.metrics?.cash}
+                sub={data.metrics?.cashNote}
+                tone="bad"
+              />
+              <LedgerRow
+                label="Receivables"
+                value={data.metrics?.receivables}
+                sub={data.metrics?.receivablesNote}
+                tone="bad"
+              />
+            </>
+          ) : (
+            <div className="py-4 flex items-center gap-2 text-xs" style={{ color: "#8890A0" }}>
+              <Lock size={14} />
+              Cash on hand and receivables are in the full report
+            </div>
+          )}
         </div>
+      </div>
+
+      {!paid && (
+        <div
+          className="mt-6 rounded-lg p-5"
+          style={{ background: ink, color: "#FFFFFF" }}
+        >
+          <div className="text-base" style={{ fontFamily: "'Fraunces', serif" }}>
+            See the rest of your report
+          </div>
+          <p className="text-xs mt-1.5" style={{ color: "#C9CFDC" }}>
+            Unlock every recommendation, cash and receivables, overdue
+            collections, and the AI CFO chat about your numbers.
+          </p>
+          <button
+            className="mt-4 w-full py-3 rounded-md text-sm font-medium"
+            style={{ background: gold, color: "#FFFFFF" }}
+            onClick={onUnlock}
+          >
+            Unlock full report
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LockedTab({ title, pitch, onUnlock }) {
+  return (
+    <div
+      className="h-full flex flex-col items-center justify-center text-center px-8"
+      style={{ background: paper }}
+    >
+      <Lock size={28} color={gold} />
+      <h2 className="text-xl mt-4" style={{ color: ink, fontFamily: "'Fraunces', serif" }}>
+        {title}
+      </h2>
+      <p className="text-sm mt-2" style={{ color: "#5B6478" }}>
+        {pitch}
+      </p>
+      <button
+        className="mt-6 w-full py-3 rounded-md text-sm font-medium"
+        style={{ background: gold, color: "#FFFFFF" }}
+        onClick={onUnlock}
+      >
+        Choose a plan
+      </button>
+    </div>
+  );
+}
+
+function Landing({ onStart, onSample }) {
+  return (
+    <div
+      className="h-full overflow-y-auto px-6 pt-10 pb-6 flex flex-col"
+      style={{ background: paper }}
+    >
+      <div className="text-sm font-medium" style={{ color: gold }}>
+        Futusure AI CFO
+      </div>
+      <h1
+        className="text-3xl mt-6 leading-tight"
+        style={{ color: ink, fontFamily: "'Fraunces', serif" }}
+      >
+        Is your business financially healthy? Find out in a minute.
+      </h1>
+      <p className="text-sm mt-4" style={{ color: "#5B6478" }}>
+        Upload a trial balance or profit and loss statement. An AI CFO reads
+        it and gives you a health score with a plain-language verdict, free.
+      </p>
+
+      <button
+        className="mt-8 w-full py-3.5 rounded-md text-sm font-medium"
+        style={{ background: gold, color: "#FFFFFF" }}
+        onClick={onStart}
+      >
+        Check my business health free
+      </button>
+      <button
+        className="mt-3 text-xs underline self-center"
+        style={{ color: "#5B6478" }}
+        onClick={onSample}
+      >
+        See a sample report first
+      </button>
+
+      <div className="mt-10 text-sm" style={{ color: ink }}>
+        <div className="font-medium">Free</div>
+        <p className="mt-1" style={{ color: "#5B6478" }}>
+          Health score, headline verdict, top recommendation, revenue and net profit.
+        </p>
+        <div className="font-medium mt-5">Full report, from {formatPrice(PLANS.onetime.prices[detectDefaultCurrency()], detectDefaultCurrency())}</div>
+        <p className="mt-1" style={{ color: "#5B6478" }}>
+          Every recommendation, cash and receivables, overdue collections, reminder drafts, and chat with your AI CFO.
+        </p>
+      </div>
+
+      <div className="mt-auto pt-8 flex items-center gap-2 text-xs" style={{ color: "#8890A0" }}>
+        <ShieldCheck size={14} />
+        Your statement is analysed for your report and stays on your device.
       </div>
     </div>
   );
@@ -1061,7 +1177,7 @@ function PlansScreen({ onPaid, onSkipDemo }) {
         style={{ color: "#8890A0" }}
         onClick={onSkipDemo}
       >
-        Continue with free sample data instead
+        Not now, back to my free report
       </button>
     </div>
   );
@@ -1161,7 +1277,8 @@ function ReceiptScreen({ receipt, onContinue }) {
 // ROOT
 // ─────────────────────────────────────────────────────────────
 export default function App() {
-  const [step, setStep] = useState("loading"); // loading | plans | receipt | onboarding | app
+  const [step, setStep] = useState("loading"); // loading | landing | onboarding | plans | receipt | app
+  const [paid, setPaid] = useState(false);
   const [receipt, setReceipt] = useState(null);
   const [businessData, setBusinessDataState] = useState(null);
   const [tab, setTab] = useState("home");
@@ -1208,6 +1325,7 @@ export default function App() {
           localStorage.setItem(PAID_KEY, JSON.stringify({ plan: data.plan, ...receiptObj }));
           localStorage.setItem(RECEIPT_KEY, JSON.stringify(receiptObj));
           setReceipt(receiptObj);
+          setPaid(true);
           setStep("receipt");
           return true;
         }
@@ -1228,13 +1346,16 @@ export default function App() {
         if (savedBusinessData) setBusinessDataState(JSON.parse(savedBusinessData));
 
         if (saved) {
+          setPaid(true);
           if (savedReceipt) setReceipt(JSON.parse(savedReceipt));
           setStep(savedBusinessData ? "app" : "onboarding");
         } else {
-          setStep("plans");
+          // Not paid yet: returning visitors with a report go back to their
+          // free preview, new visitors see the landing page first.
+          setStep(savedBusinessData ? "app" : "landing");
         }
       } catch {
-        setStep("plans");
+        setStep("landing");
       }
     };
 
@@ -1261,11 +1382,26 @@ export default function App() {
         <PlansScreen
           onPaid={(r) => {
             setReceipt(r);
+            setPaid(true);
             setStep("receipt");
           }}
-          onSkipDemo={() => {
-            // Free sample path – go straight to onboarding with sample
-            setStep("onboarding");
+          onSkipDemo={() => setStep(businessData ? "app" : "landing")}
+        />
+      </div>
+    );
+  }
+
+  if (step === "landing") {
+    return (
+      <div
+        className="w-full max-w-sm mx-auto h-[720px] rounded-2xl overflow-hidden shadow-lg"
+        style={{ fontFamily: "'IBM Plex Sans', sans-serif" }}
+      >
+        <Landing
+          onStart={() => setStep("onboarding")}
+          onSample={() => {
+            setBusinessData(DEMO_DATA);
+            setStep("app");
           }}
         />
       </div>
@@ -1297,10 +1433,27 @@ export default function App() {
     );
   }
 
+  const goPlans = () => setStep("plans");
   const screens = {
-    home: <HomeScreen data={businessData} />,
-    chat: <ChatScreen data={businessData} />,
-    business: <BusinessScreen data={businessData} />,
+    home: <HomeScreen data={businessData} paid={paid} onUnlock={goPlans} />,
+    chat: paid ? (
+      <ChatScreen data={businessData} />
+    ) : (
+      <LockedTab
+        title="Ask your AI CFO"
+        pitch="Chat about your cash, collections and next steps, with answers based on your own numbers."
+        onUnlock={goPlans}
+      />
+    ),
+    business: paid ? (
+      <BusinessScreen data={businessData} />
+    ) : (
+      <LockedTab
+        title="Business details"
+        pitch="Overdue collections, receivables ageing and reminder drafts for your customers."
+        onUnlock={goPlans}
+      />
+    ),
   };
 
   const tabs = [
@@ -1334,6 +1487,7 @@ export default function App() {
                 style={{ color: active ? ink : "#B0B6C2" }}
               >
                 {t.label}
+                {!paid && t.id !== "home" ? " (locked)" : ""}
               </span>
             </button>
           );
